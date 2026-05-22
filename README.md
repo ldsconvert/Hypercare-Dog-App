@@ -1,25 +1,25 @@
-# Hypercare Pet Dashboard 🐾
+# Inventory Hound Dashboard 🐶
 
-A simple Streamlit app that turns your Hypercare metrics into a fun **cyber pet** + an **exec-ready dashboard**.
+One dog per product. Upload a **BOTF PI Daily** PDF and the app parses the PRIMA/ULTRA summary rows.
 
-## What it uses (from your workbooks)
-- Hypercare workbook sheet: **Adoption Report**
-- Hypercare workbook sheet: **Hypercare Tasks**
-- Metric pack sheet (optional): **Hypercare Interface Report**
-- ServiceNow export (optional): **CSV** with a State/Status column
+## What it looks for in the PDF
+It scans for product rows like **PRIMA 60**, **PRIMA 100**, **PRIMA 220**, **PRIMA 600**, **ULTRA 4**, **ULTRA 6** in the summary section.
 
-## Quick start
-1. Install Python 3.10+.
-2. In a terminal:
-   - `pip install -r requirements.txt`
-3. Run:
-   - `streamlit run app.py`
+## How the dogs work
+- **Happiness** is driven by Days of Inventory (Avail Inv Days)
+- **Hunger** is driven by capacity % (low % = hungry, high % = overfull)
+- **Energy** blends happiness + hunger + available room days
 
-## How to use
-- Upload your Excel files in the left sidebar.
-- Upload your ServiceNow CSV export (optional) to populate the Tickets tab.
-- Use **Feed / Play / Rest / Daily check-in** to make the pet feel alive.
+## Run locally
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
 
-## Notes
-- The app does **not** directly connect to ServiceNow.
-- It’s designed for minimal coding: upload files + go.
+## Deploy on Streamlit
+Upload these files to your GitHub repo:
+- app.py
+- requirements.txt
+- README.md
+
+Then deploy in Streamlit Community Cloud.
