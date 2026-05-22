@@ -1,48 +1,75 @@
 import json
+import re
 from dataclasses import dataclass, asdict
-from datetime import datetime, date
+from datetime import date
 from pathlib import Path
-from typing import Optional, Tuple, Dict
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+from PyPDF2 import PdfReader
 
-# ---------------------------
-# Hypercare Pet Dashboard
-# Business + Cyber Pet Combo
-# ---------------------------
+# =============================
+# Inventory Hound Dashboard 🐶
+# One dog per product
+# Reads: BOTF PI Daily PDF (and similar)
+# =============================
 
-STATE_FILE = Path('.hypercare_pet_state.json')
+STATE_FILE = Path('.inventory_hounds_state.json')
+
+DOG = {
+    "happy": "🐶✨",
+    "ok": "🐶",
+    "worry": "🐶⚠️",
+    "sad": "🐶💧",
+    "sleep": "🐶💤",
+    "treat": "🦴",
+    "walk": "🦮",
+    "fetch": "🎾",
+    "bark": "🗣️",
+    "alert": "🚨",
+    "celebrate": "🎉",
+}
+
+DEFAULT_BREED = "Lab (steady & friendly)"
+BREEDS = [
+    "Lab (steady & friendly)",
+    "Shepherd (focused & protective)",
+    "Corgi (high energy)",
+    "Husky (dramatic communicator)",
+    "Mutt (scrappy problem-solver)",
+]
+
+BARKS = {
+    "Lab (steady & friendly)": ["Woof! Inventory looks manageable.", "Tail wagging—keep supply steady!"],
+    "Shepherd (focused & protective)": ["Alert: watch DOI and tank space.", "Protect the system—avoid stockouts."],
+    "Corgi (high energy)": ["Zoomies! Let’s build inventory buffer!", "Treats for stable DOI!"],
+    "Husky (dramatic communicator)": ["Awoooo… capacity is tight.", "Awooo! DOI needs attention."],
+    "Mutt (scrappy problem-solver)": ["I’ll sniff out the constraint.", "We’ll improvise and stabilize."],
+}
 
 TARGETS = {
-    "adoption_rate": 0.80,  # from your adoption legend (>=80% = on track)
-    "interface_success": 0.99,
-    "max_open_tickets": 25,
-    "max_overdue_tasks": 25,
+    "doi_good": 10.0,     # >10 days
+    "doi_ok": 5.0,        # 5-10 days
+    "doi_risk": 3.0,      # 3-5 days
+    "cap_low": 40.0,      # <40% = too low
+    "cap_high": 70.0,     # >70% = too high (tight)
 }
 
-EMOJI = {
-    "happy": "😄",
-    "ok": "🙂",
-    "worry": "😟",
-    "sad": "😢",
-    "sleep": "😴",
-    "celebrate": "🎉",
-    "alert": "🚨",
-    "ticket": "🎫",
-    "task": "✅",
-    "adopt": "📈",
-    "interface": "🔌",
-}
+
+# -----------------------------
+# State
+# -----------------------------
 
 @dataclass
-class PetState:
-    name: str = "HyperPup"
-    hunger: int = 30      # 0-100 (higher = needs help)
-    energy: int = 70      # 0-100
-    happiness: int = 70   # 0-100
-    last_checkin: str = ""  # ISO date
+class DogState:
+    display_name: str
+    breed: str = DEFAULT_BREED
+    hunger: int = 40
+    energy: int = 70
+    happiness: int = 70
+    last_checkin: str = ""
     xp: int = 0
     level: int = 1
 
@@ -54,25 +81,44 @@ class PetState:
         self.xp = max(0, int(self.xp))
 
 
-def load_state() -> PetState:
+def _safe_int(x, default=0):
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+
+def load_all_states() -> Dict[str, dict]:
     if STATE_FILE.exists():
         try:
-            data = json.loads(STATE_FILE.read_text())
-            s = PetState(**data)
-            s.clamp()
-            return s
+            return json.loads(STATE_FILE.read_text())
         except Exception:
-            pass
-    return PetState()
+            return {}
+    return {}
 
 
-def save_state(state: PetState):
-    state.clamp()
-    STATE_FILE.write_text(json.dumps(asdict(state), indent=2))
+def save_all_states(states: Dict[str, dict]):
+    STATE_FILE.write_text(json.dumps(states, indent=2))
 
 
-def level_up(state: PetState):
-    # Simple XP ladder
+def get_state(states: Dict[str, dict], key: str, display_name: str) -> DogState:
+    if key in states:
+        s = DogState(**states[key])
+        return s
+    return DogState(display_name=display_name)
+
+
+def put_state(states: Dict[str, dict], key: str, state: DogState):
+    # clamp
+    state.hunger = max(0, min(100, int(state.hunger)))
+    state.energy = max(0, min(100, int(state.energy)))
+    state.happiness = max(0, min(100, int(state.happiness)))
+    state.level = max(1, int(state.level))
+    state.xp = max(0, int(state.xp))
+    states[key] = asdict(state)
+
+
+def level_up(state: DogState):
     needed = 100 + (state.level - 1) * 75
     while state.xp >= needed:
         state.xp -= needed
@@ -80,424 +126,399 @@ def level_up(state: PetState):
         needed = 100 + (state.level - 1) * 75
 
 
-def pet_face(state: PetState) -> str:
-    # Mood based on combined health
-    stress = (state.hunger * 0.5) + ((100 - state.energy) * 0.25) + ((100 - state.happiness) * 0.25)
-    if state.energy < 25:
-        return EMOJI["sleep"]
+def mood_face(hunger: int, energy: int, happiness: int) -> str:
+    stress = (hunger * 0.5) + ((100 - energy) * 0.25) + ((100 - happiness) * 0.25)
+    if energy < 25:
+        return DOG["sleep"]
     if stress < 25:
-        return EMOJI["happy"]
+        return DOG["happy"]
     if stress < 45:
-        return EMOJI["ok"]
+        return DOG["ok"]
     if stress < 65:
-        return EMOJI["worry"]
-    return EMOJI["sad"]
+        return DOG["worry"]
+    return DOG["sad"]
 
 
-def score_from_metrics(adoption_rate: Optional[float], interface_success: Optional[float], open_tickets: Optional[int], overdue_tasks: Optional[int]) -> Dict[str, int]:
-    """Convert business metrics into pet stats (0-100). Higher hunger = worse."""
-    # Happiness: adoption and interface health
-    h = 70
-    if adoption_rate is not None:
-        # Scale around target 0.80
-        h = int(50 + 50 * min(1.0, max(0.0, adoption_rate / TARGETS["adoption_rate"])))
-    if interface_success is not None:
-        h = int((h + (50 + 50 * min(1.0, max(0.0, interface_success / TARGETS["interface_success"])))) / 2)
+# -----------------------------
+# PDF parsing
+# -----------------------------
 
-    # Hunger: tickets + overdue tasks
-    hunger = 25
-    if open_tickets is not None:
-        hunger += int(60 * min(1.0, open_tickets / max(1, TARGETS["max_open_tickets"])))
-    if overdue_tasks is not None:
-        hunger += int(40 * min(1.0, overdue_tasks / max(1, TARGETS["max_overdue_tasks"])))
-    hunger = max(0, min(100, hunger))
-
-    # Energy: tasks progress proxy
-    energy = 70
-    if overdue_tasks is not None:
-        energy = int(85 - 60 * min(1.0, overdue_tasks / max(1, TARGETS["max_overdue_tasks"])))
-    energy = max(0, min(100, energy))
-
-    return {"happiness": h, "hunger": hunger, "energy": energy}
+def extract_text_from_pdf(upload) -> str:
+    reader = PdfReader(upload)
+    chunks = []
+    for page in reader.pages:
+        t = page.extract_text() or ""
+        chunks.append(t)
+    return "\n".join(chunks)
 
 
-# ---------------------------
-# Data loaders
-# ---------------------------
-
-def try_read_excel(upload, sheet_name: str) -> Optional[pd.DataFrame]:
+def _to_float(token: str) -> Optional[float]:
+    if token is None:
+        return None
+    token = token.strip()
+    if token in ["#DIV/0!", "DIV/0", "-"]:
+        return None
+    token = token.replace(",", "")
     try:
-        return pd.read_excel(upload, sheet_name=sheet_name, engine='openpyxl')
+        return float(token)
     except Exception:
         return None
 
 
-def parse_adoption(df: pd.DataFrame) -> Tuple[Optional[float], pd.DataFrame]:
-    """Expect columns like Workstream, Total Users, Trained, Active in SAP, Adoption %"""
-    if df is None or df.empty:
-        return None, pd.DataFrame()
+def parse_product_summary(text: str) -> List[dict]:
+    """Parse the bottom summary table (PRIMA/ULTRA rows).
 
-    # Normalize columns
-    cols = {c: c.strip() for c in df.columns}
-    df = df.rename(columns=cols)
+    Expected tokens per product (typical):
+    Grade, Prod(KBD), Inv incl heels(KBBL), Avail Inv(KBBL), Avail Room(KBBL), Working Cap(KBBL), Cap%, Avail Inv Days, Avail Room Days, DOI label (optional)
 
-    # Keep only plausible rows
-    needed = ["Workstream", "Total Users", "Trained", "Active in SAP"]
-    if not all(c in df.columns for c in needed):
-        return None, pd.DataFrame()
+    The PDF may place these on one line OR many lines; we handle both.
+    """
 
-    clean = df[needed + (["Adoption %"] if "Adoption %" in df.columns else [])].copy()
-    # Drop totals row if present
-    clean = clean[clean["Workstream"].astype(str).str.upper() != "TOTAL"]
+    # Normalize whitespace
+    t = re.sub(r"\s+", " ", text)
 
-    # Compute adoption if missing
-    if "Adoption %" not in clean.columns:
-        clean["Adoption %"] = clean["Active in SAP"] / clean["Total Users"].replace(0, pd.NA)
+    # Fast path: try regex row style
+    row_re = re.compile(
+        r"\b((?:PRIMA|ULTRA)\s+\d+)\s+"  # name
+        r"([0-9\.]+|#DIV/0!)\s+"          # prod
+        r"([0-9,]+|#DIV/0!)\s+"           # inv
+        r"([0-9,]+|#DIV/0!)\s+"           # avail inv
+        r"([0-9,]+|#DIV/0!)\s+"           # avail room
+        r"([0-9,]+|#DIV/0!)\s+"           # cap
+        r"(\d+)%\s+"                      # cap%
+        r"([0-9\.]+|#DIV/0!)\s+"          # avail inv days
+        r"([0-9\.]+|#DIV/0!)"              # avail room days
+        r"(?:\s+([<>]\s*\d+\s+days|\d+\s*-\s*\d+\s+days))?",  # optional label
+        re.IGNORECASE
+    )
 
-    # Overall adoption weighted by total users
-    try:
-        overall = (clean["Active in SAP"].sum() / clean["Total Users"].sum())
-    except Exception:
-        overall = None
+    rows = []
+    for m in row_re.finditer(t):
+        name = m.group(1).upper().replace("  ", " ").strip()
+        prod_kbd = _to_float(m.group(2))
+        inv_kbbl = _to_float(m.group(3))
+        avail_inv_kbbl = _to_float(m.group(4))
+        avail_room_kbbl = _to_float(m.group(5))
+        cap_kbbl = _to_float(m.group(6))
+        cap_pct = _to_float(m.group(7))
+        avail_inv_days = _to_float(m.group(8))
+        avail_room_days = _to_float(m.group(9))
+        doi_label = (m.group(10) or "").strip()
 
-    return overall, clean
+        rows.append({
+            "product": name,
+            "prod_kbd": prod_kbd,
+            "inv_kbbl": inv_kbbl,
+            "avail_inv_kbbl": avail_inv_kbbl,
+            "avail_room_kbbl": avail_room_kbbl,
+            "cap_kbbl": cap_kbbl,
+            "cap_pct": cap_pct,
+            "avail_inv_days": avail_inv_days,
+            "avail_room_days": avail_room_days,
+            "doi_label": doi_label,
+        })
 
+    if rows:
+        # Deduplicate by product
+        seen = set()
+        out = []
+        for r in rows:
+            if r["product"] not in seen and r["product"] != "TOTAL":
+                out.append(r)
+                seen.add(r["product"])
+        return out
 
-def parse_tasks(df: pd.DataFrame) -> Tuple[int, pd.DataFrame]:
-    """Expect columns like Task Name, Finish, % Complete, Status, Owner Email (Lookup)"""
-    if df is None or df.empty:
-        return 0, pd.DataFrame()
+    # Fallback: token state machine
+    tokens = re.findall(r"PRIMA|ULTRA|\d+\.\d+|\d+%|\d+|#DIV/0!|>|<|-|days", text, flags=re.IGNORECASE)
+    tokens = [tok for tok in tokens if tok.strip()]
 
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i].upper()
+        if tok in ["PRIMA", "ULTRA"] and i + 1 < len(tokens):
+            num = tokens[i+1]
+            if not re.match(r"^\d+$", num):
+                i += 1
+                continue
+            name = f"{tok} {num}"
+            i += 2
 
-    # Try to find common columns
-    finish_col = None
-    for c in df.columns:
-        if str(c).lower() in ["finish", "due", "due date", "end", "end date"]:
-            finish_col = c
-            break
+            # collect until next PRIMA/ULTRA or TOTAL
+            buf = []
+            while i < len(tokens) and tokens[i].upper() not in ["PRIMA", "ULTRA", "TOTAL"]:
+                buf.append(tokens[i])
+                i += 1
 
-    pct_col = None
-    for c in df.columns:
-        if "%" in str(c) and "complete" in str(c).lower():
-            pct_col = c
-            break
-        if str(c).lower() in ["% complete", "percent complete", "complete"]:
-            pct_col = c
-            break
+            # We expect cap% token somewhere
+            cap_pct = None
+            for b in buf:
+                if b.endswith('%'):
+                    cap_pct = _to_float(b.replace('%',''))
 
-    name_col = None
-    for c in df.columns:
-        if str(c).lower() in ["task name", "name", "task"]:
-            name_col = c
-            break
+            # Try map numeric sequence
+            nums = []
+            for b in buf:
+                if b.lower() == 'days':
+                    continue
+                if b in ['>','<','-']:
+                    continue
+                if b.endswith('%'):
+                    continue
+                v = _to_float(b)
+                if v is not None:
+                    nums.append(v)
 
-    if finish_col is None or pct_col is None:
-        return 0, pd.DataFrame()
+            # Try to find DOI label
+            doi_label = ""
+            if 'days' in [x.lower() for x in buf]:
+                # grab tail from last '>'/'<' or numbers around '-'
+                tail = " ".join(buf[-4:])
+                tail = tail.replace(' - ', '-').replace('  ', ' ')
+                if 'days' in tail.lower():
+                    doi_label = tail
 
-    # Parse % complete
-    pct = df[pct_col]
-    def to_float(x):
-        if pd.isna(x):
-            return 0.0
-        s = str(x).strip()
-        if s.endswith('%'):
-            try:
-                return float(s[:-1]) / 100
-            except Exception:
-                return 0.0
-        try:
-            return float(s)
-        except Exception:
-            return 0.0
+            def n(idx):
+                return nums[idx] if idx < len(nums) else None
 
-    df["_pct"] = pct.apply(to_float)
+            rows.append({
+                "product": name,
+                "prod_kbd": n(0),
+                "inv_kbbl": n(1),
+                "avail_inv_kbbl": n(2),
+                "avail_room_kbbl": n(3),
+                "cap_kbbl": n(4),
+                "cap_pct": cap_pct,
+                "avail_inv_days": n(5),
+                "avail_room_days": n(6),
+                "doi_label": doi_label,
+            })
+        else:
+            i += 1
 
-    # Parse dates
-    df["_finish"] = pd.to_datetime(df[finish_col], errors='coerce')
-
-    today = pd.Timestamp(date.today())
-    overdue = df[(df["_finish"].notna()) & (df["_finish"] < today) & (df["_pct"] < 0.999)]
-
-    # Prep a clean table
-    keep = []
-    if name_col: keep.append(name_col)
-    keep += [finish_col, pct_col]
-    for c in ["Status", "Task Owner (from MMP)", "Owner Email (Lookup)", "Notes"]:
-        if c in df.columns:
-            keep.append(c)
-    clean = overdue[keep].copy()
-    clean = clean.sort_values(by=finish_col)
-
-    return int(len(overdue)), clean
-
-
-def parse_interface(df: pd.DataFrame) -> Tuple[Optional[float], Optional[int], Optional[int], pd.DataFrame]:
-    """Expect columns including Status with ✅/⚠️/🔴 and Workstream / Interface Name"""
-    if df is None or df.empty:
-        return None, None, None, pd.DataFrame()
-
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    if "Status" not in df.columns:
-        return None, None, None, pd.DataFrame()
-
-    status = df["Status"].astype(str)
-    ok = status.str.contains('✅')
-    warn = status.str.contains('⚠️')
-    fail = status.str.contains('🔴')
-
-    total = int(len(df))
-    ok_count = int(ok.sum())
-    warn_count = int(warn.sum())
-    fail_count = int(fail.sum())
-
-    success = (ok_count / total) if total else None
-
-    # Minimal table
-    keep = [c for c in ["Workstream", "Interface Name", "Source System", "Target System", "Frequency", "Status"] if c in df.columns]
-    table = df[keep].copy() if keep else df.head(25)
-
-    return success, warn_count, fail_count, table
-
-
-def parse_servicenow(df: pd.DataFrame) -> Tuple[Optional[int], Optional[int], pd.DataFrame]:
-    """Very forgiving: tries to find state/status and priority."""
-    if df is None or df.empty:
-        return None, None, pd.DataFrame()
-
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-
-    # Find a state/status column
-    state_col = None
-    for c in df.columns:
-        if str(c).lower() in ["state", "status", "incident state", "ticket state"]:
-            state_col = c
-            break
-
-    # If no state column, we can't compute open/closed reliably
-    if state_col is None:
-        return None, None, df.head(50)
-
-    states = df[state_col].astype(str).str.lower()
-    closed_mask = states.str.contains('closed') | states.str.contains('resolved') | states.str.contains('complete')
-    open_mask = ~closed_mask
-
-    open_count = int(open_mask.sum())
-    closed_count = int(closed_mask.sum())
-
-    # Display table (top open)
-    keep_cols = []
-    for c in ["Snow Number", "Number", "Short description", "Short Description", "Module", "Priority", state_col, "Assignment group", "Assigned to", "Created", "Opened", "Updated"]:
-        if c in df.columns and c not in keep_cols:
-            keep_cols.append(c)
-    table = df.loc[open_mask, keep_cols].head(50) if keep_cols else df.loc[open_mask].head(50)
-
-    return open_count, closed_count, table
+    # Deduplicate
+    seen = set()
+    out = []
+    for r in rows:
+        if r["product"] and r["product"] not in seen and r["product"] != "TOTAL":
+            out.append(r)
+            seen.add(r["product"])
+    return out
 
 
-# ---------------------------
+def doi_bucket(doi: Optional[float], doi_label: str) -> Optional[float]:
+    if doi is not None:
+        return doi
+    l = (doi_label or "").lower()
+    if ">" in l and "10" in l:
+        return 12.0
+    if "5" in l and "10" in l:
+        return 7.0
+    if "<" in l and "5" in l:
+        return 3.0
+    return None
+
+
+# -----------------------------
+# Dog stats from inventory
+# -----------------------------
+
+def compute_dog_stats(cap_pct: Optional[float], doi: Optional[float], room_days: Optional[float]) -> Tuple[int, int, int]:
+    # Happiness from DOI
+    if doi is None:
+        happiness = 60
+    elif doi > TARGETS["doi_good"]:
+        happiness = 90
+    elif doi >= TARGETS["doi_ok"]:
+        happiness = 70
+    elif doi >= TARGETS["doi_risk"]:
+        happiness = 40
+    else:
+        happiness = 20
+
+    # Hunger from capacity%
+    if cap_pct is None:
+        hunger = 50
+    elif cap_pct < TARGETS["cap_low"]:
+        hunger = 80
+    elif cap_pct <= TARGETS["cap_high"]:
+        hunger = 40
+    else:
+        hunger = 20
+
+    # Room score from available room days
+    if room_days is None:
+        room_score = 60
+    elif room_days > 10:
+        room_score = 85
+    elif room_days >= 5:
+        room_score = 65
+    else:
+        room_score = 35
+
+    energy = int((happiness + (100 - hunger) + room_score) / 3)
+    return happiness, hunger, energy
+
+
+# -----------------------------
 # UI
-# ---------------------------
+# -----------------------------
 
-st.set_page_config(page_title='Hypercare Pet Dashboard', page_icon='🐾', layout='wide')
-
-state = load_state()
-
-st.title('🐾 Hypercare Pet Dashboard (Business + Pet Combo)')
+st.set_page_config(page_title='Inventory Hound Dashboard', page_icon='🐶', layout='wide')
+st.title('🐶 Inventory Hound Dashboard (One Dog per Product)')
+st.caption('Upload a BOTF PI Daily PDF. Each product gets its own dog whose mood is driven by Days of Inventory (DOI) + capacity pressure.')
 
 with st.sidebar:
-    st.header('Data Inputs')
-    hc_file = st.file_uploader('Upload your Hypercare workbook (Excel)', type=['xlsx', 'xlsm'])
-    metric_file = st.file_uploader('Upload your Hypercare metric pack (Excel) (optional)', type=['xlsx', 'xlsm'])
-    sn_file = st.file_uploader('Upload ServiceNow export (CSV) (optional)', type=['csv'])
-
+    st.header('Upload')
+    pdf_file = st.file_uploader('BOTF PI Daily report (PDF)', type=['pdf'])
     st.divider()
-    st.header('Pet Settings')
-    state.name = st.text_input('Pet name', value=state.name)
+    st.header('Dog Actions (optional)')
+    st.caption('You can give treats/walk/fetch, but dogs will always drift toward the inventory-driven health score.')
 
-    st.caption('Pet = your Hypercare health. Better metrics → happier pet.')
+states_raw = load_all_states()
 
-    st.divider()
-    st.header('Actions')
-    colA, colB = st.columns(2)
-    if colA.button('Feed (reduce hunger) 🍖'):
-        state.hunger -= 12
-        state.happiness += 4
-        state.xp += 10
-    if colB.button('Play (boost happiness) 🎾'):
-        state.happiness += 10
-        state.energy -= 10
-        state.xp += 10
-    if st.button('Rest (restore energy) 🛌'):
-        state.energy += 18
-        state.hunger += 4
-        state.xp += 6
+report_text = ""
+products = []
 
-    if st.button('Daily check-in ✅'):
-        today_s = date.today().isoformat()
-        if state.last_checkin != today_s:
-            state.last_checkin = today_s
-            state.xp += 25
-            state.happiness += 6
-        else:
-            st.info('Already checked in today.')
-
-    level_up(state)
-    save_state(state)
-
-# --- Load data
-adoption_rate = None
-adoption_df = pd.DataFrame()
-
-overdue_tasks = None
-overdue_tasks_df = pd.DataFrame()
-
-interface_success = None
-interface_warn = None
-interface_fail = None
-interface_df = pd.DataFrame()
-
-open_tickets = None
-closed_tickets = None
-sn_table = pd.DataFrame()
-
-if hc_file is not None:
-    # Sheet names based on your workbook navigation
-    adoption_sheet = "Adoption Report"
-    tasks_sheet = "Hypercare Tasks"
-
-    df_adopt_raw = try_read_excel(hc_file, adoption_sheet)
-    adoption_rate, adoption_df = parse_adoption(df_adopt_raw)
-
-    df_tasks_raw = try_read_excel(hc_file, tasks_sheet)
-    overdue_tasks, overdue_tasks_df = parse_tasks(df_tasks_raw)
-
-if metric_file is not None:
-    # Your metric pack uses "Hypercare Interface Report" tab
-    interface_sheet = "Hypercare Interface Report"
-    df_int_raw = try_read_excel(metric_file, interface_sheet)
-    interface_success, interface_warn, interface_fail, interface_df = parse_interface(df_int_raw)
-
-if sn_file is not None:
+if pdf_file is not None:
     try:
-        sn_raw = pd.read_csv(sn_file)
-        open_tickets, closed_tickets, sn_table = parse_servicenow(sn_raw)
-    except Exception:
-        pass
+        report_text = extract_text_from_pdf(pdf_file)
+        products = parse_product_summary(report_text)
+    except Exception as e:
+        st.error('Could not read PDF text. Try a different export or a clearer PDF.')
+        st.stop()
 
-# If ServiceNow not provided, approximate open tickets from metric pack weekly tracker not populated; leave as None
+if not products:
+    st.info('Upload a PDF to generate dogs. Tip: the app looks for the PRIMA/ULTRA summary rows near the bottom of the report.')
+    st.stop()
 
-# --- Convert metrics to pet stats
-scores = score_from_metrics(adoption_rate, interface_success, open_tickets, overdue_tasks)
+# Build a dataframe for display
+view = pd.DataFrame(products)
 
-# Blend current pet stats toward metric-based stats (keeps the pet feeling alive)
-blend = 0.35
-state.happiness = int(state.happiness * (1 - blend) + scores['happiness'] * blend)
-state.hunger = int(state.hunger * (1 - blend) + scores['hunger'] * blend)
-state.energy = int(state.energy * (1 - blend) + scores['energy'] * blend)
-level_up(state)
-save_state(state)
+# Compute inventory-driven scores per product
+for p in products:
+    doi = doi_bucket(p.get('avail_inv_days'), p.get('doi_label',''))
+    cap_pct = p.get('cap_pct')
+    room_days = p.get('avail_room_days')
 
-# --- Header: pet + tiles
-left, mid, right = st.columns([1.2, 2.2, 1.6])
+    inv_happiness, inv_hunger, inv_energy = compute_dog_stats(cap_pct, doi, room_days)
 
-with left:
-    st.subheader(f"{pet_face(state)}  {state.name}")
-    st.caption(f"Level {state.level} • XP {state.xp}")
-    st.progress(max(0, min(100, 100 - state.hunger)), text=f"Hunger (needs help): {state.hunger}/100")
-    st.progress(state.energy, text=f"Energy: {state.energy}/100")
-    st.progress(state.happiness, text=f"Happiness: {state.happiness}/100")
+    key = p['product']
+    display_name = f"{p['product']} Pup"
+    st_dog = get_state(states_raw, key, display_name)
 
-with mid:
-    st.subheader('Today’s Hypercare Health')
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric(f"{EMOJI['adopt']} Adoption", "—" if adoption_rate is None else f"{adoption_rate:.0%}")
-    c2.metric(f"{EMOJI['interface']} Interface success", "—" if interface_success is None else f"{interface_success:.0%}")
-    c3.metric(f"{EMOJI['ticket']} Open tickets", "—" if open_tickets is None else f"{open_tickets}")
-    c4.metric(f"{EMOJI['task']} Overdue tasks", "—" if overdue_tasks is None else f"{overdue_tasks}")
+    # Drift toward inventory-derived state
+    blend = 0.55
+    st_dog.happiness = int(st_dog.happiness * (1 - blend) + inv_happiness * blend)
+    st_dog.hunger = int(st_dog.hunger * (1 - blend) + inv_hunger * blend)
+    st_dog.energy = int(st_dog.energy * (1 - blend) + inv_energy * blend)
 
-    # Quick guidance
-    tips = []
-    if adoption_rate is not None and adoption_rate < TARGETS['adoption_rate']:
-        tips.append(f"{EMOJI['alert']} Adoption is below {TARGETS['adoption_rate']:.0%}. Consider targeting low-adoption workstreams with quick refreshers.")
-    if interface_success is not None and interface_success < TARGETS['interface_success']:
-        tips.append(f"{EMOJI['alert']} Interface success is below {TARGETS['interface_success']:.0%}. Review the at-risk interfaces list.")
-    if open_tickets is not None and open_tickets > TARGETS['max_open_tickets']:
-        tips.append(f"{EMOJI['alert']} Open tickets are high (> {TARGETS['max_open_tickets']}). Consider a triage sweep + aging review.")
-    if overdue_tasks is not None and overdue_tasks > 0:
-        tips.append(f"{EMOJI['alert']} You have overdue tasks. Focus on the top 5 oldest due dates first.")
+    # Persist updated drift
+    put_state(states_raw, key, st_dog)
 
-    if tips:
-        for t in tips[:4]:
-            st.write(f"- {t}")
-    else:
-        st.write(f"- {EMOJI['celebrate']} Looking good — keep the rhythm (daily check-in + keep tickets moving).")
+save_all_states(states_raw)
 
-with right:
-    st.subheader('Exec-ready Snapshot')
-    lines = []
-    if adoption_rate is not None:
-        lines.append(f"Adoption: {adoption_rate:.0%} (target ≥ {TARGETS['adoption_rate']:.0%})")
-    if interface_success is not None:
-        lines.append(f"Interface success: {interface_success:.0%} (target ≥ {TARGETS['interface_success']:.0%})")
-    if open_tickets is not None and closed_tickets is not None:
-        lines.append(f"Tickets: {open_tickets} open / {closed_tickets} closed (from export)")
-    elif open_tickets is not None:
-        lines.append(f"Tickets: {open_tickets} open")
-    if overdue_tasks is not None:
-        lines.append(f"Overdue tasks: {overdue_tasks}")
+# Alerts
+alerts = []
+for p in products:
+    doi = doi_bucket(p.get('avail_inv_days'), p.get('doi_label',''))
+    cap_pct = p.get('cap_pct')
+    if doi is not None and doi < 5:
+        alerts.append(f"{DOG['alert']} {p['product']}: DOI is low ({doi:.1f} days)")
+    if cap_pct is not None and cap_pct > 70:
+        alerts.append(f"{DOG['alert']} {p['product']}: Capacity is high ({cap_pct:.0f}%)")
+    if cap_pct is not None and cap_pct < 40:
+        alerts.append(f"{DOG['alert']} {p['product']}: Capacity is low ({cap_pct:.0f}%)")
 
-    if not lines:
-        st.info('Upload at least the Hypercare workbook to generate a snapshot.')
-    else:
-        st.code("\n".join([f"• {x}" for x in lines]), language='markdown')
+st.subheader('Quick Alerts')
+if alerts:
+    for a in alerts[:10]:
+        st.write(f"- {a}")
+else:
+    st.write(f"- {DOG['celebrate']} No major DOI/capacity alarms detected.")
 
-# --- Tabs
 st.divider()
 
-tab1, tab2, tab3, tab4 = st.tabs(['📈 Adoption', '✅ Tasks', '🎫 Tickets', '🔌 Interfaces'])
+# Render dogs grid
+st.subheader('Dogs by Product')
+cols = st.columns(3)
 
-with tab1:
-    st.subheader('Adoption by workstream')
-    if adoption_df.empty:
-        st.warning('Upload the Hypercare workbook and ensure it has an "Adoption Report" sheet with columns: Workstream, Total Users, Trained, Active in SAP.')
-    else:
-        view = adoption_df.copy()
-        view['Adoption %'] = (view['Adoption %']).astype(float)
-        fig = px.bar(view, x='Workstream', y='Adoption %', color='Adoption %', color_continuous_scale='Blues', title='Adoption % by Workstream')
-        fig.update_yaxes(tickformat='.0%')
+for idx, p in enumerate(products):
+    col = cols[idx % 3]
+    key = p['product']
+    s = get_state(states_raw, key, f"{p['product']} Pup")
+
+    doi = doi_bucket(p.get('avail_inv_days'), p.get('doi_label',''))
+    cap_pct = p.get('cap_pct')
+    room_days = p.get('avail_room_days')
+
+    with col:
+        st.markdown(f"### {mood_face(s.hunger, s.energy, s.happiness)} {p['product']}")
+        st.caption(f"{s.breed} • Level {s.level} • XP {s.xp}")
+
+        st.progress(max(0, min(100, 100 - s.hunger)), text=f"Needs inventory (hunger): {s.hunger}/100")
+        st.progress(s.energy, text=f"Energy: {s.energy}/100")
+        st.progress(s.happiness, text=f"Happiness: {s.happiness}/100")
+
+        # Inventory stats
+        st.write("**Inventory inputs**")
+        st.write(f"- Capacity: **{'—' if cap_pct is None else f'{cap_pct:.0f}%'}**")
+        st.write(f"- DOI (Avail Inv Days): **{'—' if doi is None else f'{doi:.1f}'}**")
+        st.write(f"- Avail Room Days: **{'—' if room_days is None else f'{room_days:.1f}'}**")
+
+        # Optional actions per dog
+        with st.expander('Actions for this dog (optional)'):
+            s.display_name = st.text_input('Dog name', value=s.display_name, key=f"name_{key}")
+            s.breed = st.selectbox('Dog vibe', options=BREEDS, index=BREEDS.index(s.breed) if s.breed in BREEDS else 0, key=f"breed_{key}")
+
+            a1, a2, a3 = st.columns(3)
+            if a1.button(f"Treat {DOG['treat']}", key=f"treat_{key}"):
+                s.hunger -= 10
+                s.happiness += 6
+                s.xp += 10
+            if a2.button(f"Walk {DOG['walk']}", key=f"walk_{key}"):
+                s.energy += 10
+                s.hunger += 3
+                s.xp += 8
+            if a3.button(f"Fetch {DOG['fetch']}", key=f"fetch_{key}"):
+                s.happiness += 10
+                s.energy -= 6
+                s.xp += 10
+
+            if st.button('Daily check-in ✅', key=f"checkin_{key}"):
+                today_s = date.today().isoformat()
+                if s.last_checkin != today_s:
+                    s.last_checkin = today_s
+                    s.xp += 20
+                    s.happiness += 4
+                else:
+                    st.info('Already checked in today.')
+
+            level_up(s)
+            put_state(states_raw, key, s)
+            save_all_states(states_raw)
+
+        bark_line = BARKS.get(s.breed, ["Woof!"])[(s.level + s.hunger) % 2]
+        st.write(f"{DOG['bark']} **{bark_line}**")
+
+st.divider()
+
+# Analytics tab
+st.subheader('Inventory Table (parsed)')
+show_cols = [
+    'product','prod_kbd','inv_kbbl','avail_inv_kbbl','avail_room_kbbl','cap_kbbl','cap_pct','avail_inv_days','avail_room_days','doi_label'
+]
+existing = [c for c in show_cols if c in view.columns]
+st.dataframe(view[existing], use_container_width=True)
+
+# Simple charts
+if 'cap_pct' in view.columns:
+    cap_df = view.dropna(subset=['cap_pct']).copy()
+    if not cap_df.empty:
+        fig = px.bar(cap_df, x='product', y='cap_pct', title='Capacity % by Product')
         st.plotly_chart(fig, use_container_width=True)
-        st.dataframe(view, use_container_width=True)
 
-with tab2:
-    st.subheader('Overdue tasks (if any)')
-    if overdue_tasks_df.empty:
-        st.info('No overdue tasks detected (or sheet/columns not found).')
-    else:
-        st.dataframe(overdue_tasks_df, use_container_width=True)
-
-with tab3:
-    st.subheader('ServiceNow tickets (from export)')
-    if sn_file is None:
-        st.info('Upload a ServiceNow CSV export to populate this tab (this app does not directly connect to ServiceNow).')
-    else:
-        if open_tickets is None:
-            st.warning('Could not detect a State/Status column in the CSV. Try exporting a view that includes State.')
-        else:
-            st.write(f"Open tickets: **{open_tickets}** • Closed tickets: **{closed_tickets}**")
-            st.dataframe(sn_table, use_container_width=True)
-
-with tab4:
-    st.subheader('Interface health (from metric pack)')
-    if interface_df.empty:
-        st.info('Upload the Hypercare metric pack and ensure it has a "Hypercare Interface Report" sheet with a Status column (✅ / ⚠️ / 🔴).')
-    else:
-        st.write(f"At-risk (⚠️): **{interface_warn}** • Failed (🔴): **{interface_fail}**")
-        st.dataframe(interface_df, use_container_width=True)
-
-# --- Footer: Optional link to Power BI report (manual)
-st.divider()
-st.caption('Tip: You can also link/launch your existing Power BI Hypercare report from this page in your SharePoint hub as a companion.')
+if 'avail_inv_days' in view.columns:
+    doi_df = view.dropna(subset=['avail_inv_days']).copy()
+    if not doi_df.empty:
+        fig = px.bar(doi_df, x='product', y='avail_inv_days', title='Days of Inventory (Avail Inv Days) by Product')
+        st.plotly_chart(fig, use_container_width=True)
